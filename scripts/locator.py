@@ -91,7 +91,6 @@ parser.add_argument('--keras_verbose',default=1,type=int,
                     0 = silent. 1 = progress bars for minibatches. 2 = show epochs. \
                     Yes, 1 is more verbose than 2. Blame keras. \
                     default: 1. ')
-parser.add_argument('--weight_samples',default=False,action="store_true",help='normalize sample loss across space for uneven location sampling.')
 args=parser.parse_args()
 
 #set seed and gpu
@@ -161,30 +160,13 @@ def sort_samples(samples):
         print("sample ordering failed! Check that sample IDs match the VCF.")
         sys.exit()
     locs=np.array(sample_data[["x","y"]])
+    if 'weight' in sample_data.columns:
+        sample_weights=np.array(sample_data[["weight"]])
+    else:
+        sample_weights = None
     print("loaded "+str(np.shape(genotypes))+" genotypes\n\n")
     sample_data = sample_data.reset_index()
-    return(sample_data,locs)
-
-# get number of samples at each location
-def weights(sample_data, test):
-    uniq_locs = []
-    for i in range(len(sample_data)):
-        if not np.isnan(sample_data.loc[i, 'x']):
-            if (round(sample_data.loc[i, 'x']), round(sample_data.loc[i, 'y'])) not in uniq_locs:
-                uniq_locs.append((round(sample_data.loc[i, 'x']), round(sample_data.loc[i, 'y'])))
-    loc_dict = {}
-    for point in uniq_locs:
-        count = 0
-        for i in range(len(sample_data)):
-            if not np.isnan(sample_data.loc[i, 'x']):
-                if (round(sample_data.loc[i, 'x']), round(sample_data.loc[i, 'y'])) == point:
-                    count += 1
-        loc_dict.update({point : count})
-    sample_weights = []
-    for i in range(len(sample_data)):
-        if not np.isnan(sample_data.loc[i, 'x']) and i not in test:
-            sample_weights.append(10 ** -(loc_dict[(round(sample_data.loc[i, 'x']), round(sample_data.loc[i, 'y']))]))
-    return np.array(sample_weights)
+    return(sample_data,locs,sample_weights)
 
 #replace missing sites with binomial(2,mean_allele_frequency)
 def replace_md(genotypes):
@@ -226,7 +208,7 @@ def normalize_locs(locs):
     locs=np.array([[(x[0]-meanlong)/sdlong,(x[1]-meanlat)/sdlat] for x in locs])
     return meanlong,sdlong,meanlat,sdlat,locs
 
-def split_train_test(ac,locs):
+def split_train_test(ac,locs,sample_weights):
     train=np.argwhere(~np.isnan(locs[:,0]))
     train=np.array([x[0] for x in train])
     pred=np.array([x for x in range(len(locs)) if not x in train])
@@ -239,7 +221,8 @@ def split_train_test(ac,locs):
     testgen=np.transpose(ac[:,test])
     testlocs=locs[test]
     predgen=np.transpose(ac[:,pred])
-    return train,test,traingen,testgen,trainlocs,testlocs,pred,predgen
+    train_weights=sample_weights[train]
+    return train,test,traingen,testgen,trainlocs,testlocs,pred,predgen,train_weights
 
 def load_network(traingen,dropout_prop):
     from tensorflow.keras import backend as K
@@ -288,13 +271,13 @@ def load_callbacks(boot):
                                                min_lr=0)
     return checkpointer,earlystop,reducelr
 
-def train_network(model,traingen,testgen,trainlocs,testlocs,sample_weights):
+def train_network(model,traingen,testgen,trainlocs,testlocs,train_weights):
     history = model.fit(traingen, trainlocs,
                         epochs=args.max_epochs,
                         batch_size=args.batch_size,
                         shuffle=True,
                         verbose=args.keras_verbose,
-                        validation_data=(testgen,testlocs),sample_weight=sample_weights,
+                        validation_data=(testgen,testlocs),sample_weight=train_weights,
                         callbacks=[checkpointer,earlystop,reducelr])
     if args.bootstrap or args.jacknife:
         model.load_weights(args.out+"_boot"+str(boot)+"_weights.hdf5")
@@ -377,18 +360,15 @@ if args.windows:
         b=np.max(np.argwhere(mask))
         print(a,b)
         genotypes=allel.GenotypeArray(gt[a:b,:,:])
-        sample_data,locs=sort_samples(samples)
+        sample_data,locs,sample_weights=sort_samples(samples)
         meanlong,sdlong,meanlat,sdlat,locs=normalize_locs(locs)
         ac=filter_snps(genotypes)
         checkpointer,earlystop,reducelr=load_callbacks("FULL")
-        train,test,traingen,testgen,trainlocs,testlocs,pred,predgen=split_train_test(ac,locs)
-        if args.weight_samples:
-            sample_weights = weights(sample_data,test)
-        else:
-            sample_weights = None
+        train,test,traingen,testgen,trainlocs,testlocs,pred,predgen,train_weights=split_train_test(ac,locs,sample_weights)
+
         model=load_network(traingen,args.dropout_prop)
         t1=time.time()
-        history,model=train_network(model,traingen,testgen,trainlocs,testlocs,sample_weights)
+        history,model=train_network(model,traingen,testgen,trainlocs,testlocs,train_weights)
         dists=predict_locs(model,predgen,sdlong,meanlong,sdlat,meanlat,testlocs,pred,samples,testgen)
         plot_history(history,dists,args.gnuplot)
         if not args.keep_weights:
@@ -400,18 +380,14 @@ else:
     if not args.bootstrap and not args.jacknife:
         boot=None
         genotypes,samples=load_genotypes()
-        sample_data,locs=sort_samples(samples)
+        sample_data,locs,sample_weights=sort_samples(samples)
         meanlong,sdlong,meanlat,sdlat,locs=normalize_locs(locs)
         ac=filter_snps(genotypes)
         checkpointer,earlystop,reducelr=load_callbacks("FULL")
-        train,test,traingen,testgen,trainlocs,testlocs,pred,predgen=split_train_test(ac,locs)
-        if args.weight_samples == True:
-            sample_weights = weights(sample_data,test)
-        else:
-            sample_weights = None
+        train,test,traingen,testgen,trainlocs,testlocs,pred,predgen,train_weights=split_train_test(ac,locs,sample_weights)
         model=load_network(traingen,args.dropout_prop)
         start=time.time()
-        history,model=train_network(model,traingen,testgen,trainlocs,testlocs,sample_weights)
+        history,model=train_network(model,traingen,testgen,trainlocs,testlocs,train_weights)
         dists=predict_locs(model,predgen,sdlong,meanlong,sdlat,meanlat,testlocs,pred,samples,testgen)
         plot_history(history,dists,args.gnuplot)
         if not args.keep_weights:
@@ -422,18 +398,14 @@ else:
     elif args.bootstrap:
         boot="FULL"
         genotypes,samples=load_genotypes()
-        sample_data,locs=sort_samples(samples)
+        sample_data,locs,sample_weights=sort_samples(samples)
         meanlong,sdlong,meanlat,sdlat,locs=normalize_locs(locs)
         ac=filter_snps(genotypes)
         checkpointer,earlystop,reducelr=load_callbacks("FULL")
-        train,test,traingen,testgen,trainlocs,testlocs,pred,predgen=split_train_test(ac,locs)
-        if args.weight_samples == True:
-            sample_weights = weights(sample_data,test)
-        else:
-            sample_weights = None
+        train,test,traingen,testgen,trainlocs,testlocs,pred,predgen,train_weights=split_train_test(ac,locs,sample_weights)
         model=load_network(traingen,args.dropout_prop)
         start=time.time()
-        history,model=train_network(model,traingen,testgen,trainlocs,testlocs,sample_weights)
+        history,model=train_network(model,traingen,testgen,trainlocs,testlocs,train_weights)
         dists=predict_locs(model,predgen,sdlong,meanlong,sdlat,meanlat,testlocs,pred,samples,testgen)
         plot_history(history,dists,args.gnuplot)
         if not args.keep_weights:
@@ -466,18 +438,14 @@ else:
     elif args.jacknife:
         boot="FULL"
         genotypes,samples=load_genotypes()
-        sample_data,locs=sort_samples(samples)
+        sample_data,locs,sample_weights=sort_samples(samples)
         meanlong,sdlong,meanlat,sdlat,locs=normalize_locs(locs)
         ac=filter_snps(genotypes)
         checkpointer,earlystop,reducelr=load_callbacks(boot)
-        train,test,traingen,testgen,trainlocs,testlocs,pred,predgen=split_train_test(ac,locs)
-        if args.weight_samples == True:
-            sample_weights = weight(sample_data, test)
-        else:
-            sample_weights = None
+        train,test,traingen,testgen,trainlocs,testlocs,pred,predgen,train_weights=split_train_test(ac,locs,sample_weights)
         model=load_network(traingen,args.dropout_prop)
         start=time.time()
-        history,model=train_network(model,traingen,testgen,trainlocs,testlocs,sample_weights)
+        history,model=train_network(model,traingen,testgen,trainlocs,testlocs,train_weights)
         dists=predict_locs(model,predgen,sdlong,meanlong,sdlat,meanlat,testlocs,pred,samples,testgen)
         plot_history(history,dists,args.gnuplot)
         end=time.time()
