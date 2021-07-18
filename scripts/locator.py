@@ -221,7 +221,10 @@ def split_train_test(ac,locs,sample_weights):
     testgen=np.transpose(ac[:,test])
     testlocs=locs[test]
     predgen=np.transpose(ac[:,pred])
-    train_weights=sample_weights[train]
+    if sample_weights is not None:
+        train_weights=sample_weights[train]
+    else:
+        train_weights=None
     return train,test,traingen,testgen,trainlocs,testlocs,pred,predgen,train_weights
 
 def load_network(traingen,dropout_prop):
